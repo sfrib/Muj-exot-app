@@ -283,3 +283,330 @@ Web: www.vetexoticgroup.cz
 ---
 
 
+---
+
+# 1) Architektura systému (high-level)
+
+```mermaid
+flowchart LR
+  subgraph Client[Frontend • Next.js + Tailwind + TS]
+    UI[UI Komponenty\n(app/, components/)]
+    PWA[Notifikace/Offline (v2)]
+  end
+
+  subgraph API[Serverless API • pages/api/*]
+    ANIMALS[/animals.ts/]
+    SPECIES[/species.ts/]
+    HUSBANDRY[/husbandry.ts/]
+    BREEDINGS[/breedings.ts/]
+    GENETICS[/genetics.ts/]
+    MEDS[/medications.ts/]
+    TRANSFERS[/transfers.ts/]
+    NOTIFS[/notifications.ts/]
+    PAY_CREATE[/payment/create-session.ts/]
+    PAY_WH[/payment/webhook.ts/]
+    OCR[/ocr.ts (AI Alfonso)/]
+  end
+
+  subgraph DB[Supabase • PostgreSQL + Auth + Storage]
+    DBT[(Tables)]
+    RLS[Row Level Security]
+    STORAGE[(Buckets: photos,\nattachments, qr)]
+  end
+
+  subgraph Ext[Externí služby]
+    STRIPE[Stripe/GoPay\n(předplatné/platby)]
+    OPENAI[OpenAI\n(Alfonso OCR/poradce)]
+    MAPS[Map provider\n(Google/Leaflet)]
+  end
+
+  UI -->|fetch| API
+  API -->|SQL| DBT
+  API --> RLS
+  API --> STORAGE
+  API -->|webhook/checkout| STRIPE
+  API -->|chat/ocr| OPENAI
+  UI --> MAPS
+  PWA -. push .- NOTIFS
+```
+
+---
+
+# 2) ER diagram (datový model • Supabase)
+
+```mermaid
+erDiagram
+  users {
+    uuid id PK
+    text email
+    boolean is_premium
+    timestamptz created_at
+  }
+
+  species {
+    int id PK
+    text common_name
+    text latin_name
+    text origin
+    text wild_diet
+    text captive_diet
+    numeric temp_min
+    numeric temp_max
+    numeric humidity
+    boolean uvb_need
+    text enclosure_notes
+  }
+
+  animals {
+    int id PK
+    uuid owner_id FK
+    int species_id FK
+    text name
+    text sex
+    date birth_date
+    boolean acute_status
+    text notes
+    timestamptz created_at
+  }
+
+  medical_records {
+    int id PK
+    int animal_id FK
+    text diagnosis
+    text lab_results
+    timestamptz visit_date
+    text attachments_url
+  }
+
+  medications {
+    int id PK
+    int animal_id FK
+    text drug_name
+    text dosage        // mg/kg nebo plain text
+    text interval      // např. q12h
+    date start_date
+    date end_date
+    text notes
+  }
+
+  husbandry_logs {
+    int id PK
+    int animal_id FK
+    text type          // feeding|shed|weight|uvb|cleaning
+    jsonb payload      // {food:"mouse L", weight: 320, uvb:"T5 12%"}
+    timestamptz at
+    int batch_id
+  }
+
+  breedings {
+    int id PK
+    int male_id FK
+    int female_id FK
+    date paired_on
+    date expected_clutch
+    text outcome       // eggs/live/slugs/none
+    text notes
+  }
+
+  genetic_traits {
+    int id PK
+    int animal_id FK
+    text trait         // hypo|albino|cosmic...
+    text type          // dom|rec|sex-linked|het|visual
+    text source        // test|pedigree|owner
+  }
+
+  transfers {
+    int id PK
+    int animal_id FK
+    uuid from_user FK
+    uuid to_user FK
+    text status        // pending|accepted|rejected
+    text qr_token
+    timestamptz created_at
+  }
+
+  notifications {
+    int id PK
+    uuid user_id FK
+    text kind          // reminder|low-stock|med
+    text message
+    timestamptz due_at
+    boolean sent
+  }
+
+  inventory {
+    int id PK
+    uuid owner_id FK
+    text item_name
+    numeric quantity
+    text unit          // pcs|g|kg|ml|l
+    numeric threshold
+    text notes
+  }
+
+  inventory_logs {
+    int id PK
+    int inventory_id FK
+    numeric change     // +5, -1
+    text reason        // feeding|purchase|waste
+    timestamptz at
+  }
+
+  care_templates {
+    int id PK
+    uuid owner_id FK
+    text name
+    jsonb schedule     // {feeding:"7d", weight:"30d", uvb:"180d"}
+  }
+
+  users ||--o{ animals : owns
+  species ||--o{ animals : classifies
+  animals ||--o{ medical_records : has
+  animals ||--o{ medications : has
+  animals ||--o{ husbandry_logs : has
+  animals ||--o{ genetic_traits : has
+  users ||--o{ notifications : receives
+  users ||--o{ inventory : owns
+  inventory ||--o{ inventory_logs : logs
+  animals ||--o{ transfers : transferred
+  users ||--o{ care_templates : defines
+  animals ||--o{ breedings : (male/female)
+```
+
+---
+
+# 3) Sekvenční diagramy hlavních toků
+
+### 3.1 Přidání zvířete + druhová karta
+
+```mermaid
+sequenceDiagram
+  participant U as Uživatel
+  participant UI as Next.js UI
+  participant API as /api/animals
+  participant DB as Supabase
+
+  U->>UI: Vyplní formulář (jméno, druh)
+  UI->>API: POST /api/animals {name, species_id}
+  API->>DB: INSERT animals
+  DB-->>API: id, owner_id
+  API-->>UI: 201 {animal_id}
+  UI->>API: GET /api/species?id=species_id
+  API->>DB: SELECT species
+  DB-->>API: species row
+  API-->>UI: druhová karta (parametry chovu)
+```
+
+### 3.2 Husbandry log + připomínka
+
+```mermaid
+sequenceDiagram
+  participant U as Uživatel
+  participant UI as Next.js UI
+  participant API as /api/husbandry
+  participant DB as Supabase
+  participant Cron as Edge Cron
+
+  U->>UI: Přidá krmení (myš L)
+  UI->>API: POST /api/husbandry {animal_id,type:"feeding",payload}
+  API->>DB: INSERT husbandry_logs
+  DB-->>API: OK
+  API-->>UI: 201 Created
+
+  Cron->>DB: daily job → due reminders
+  DB-->>Cron: due rows
+  Cron->>API: POST /api/notifications (fan-out)
+  API->>DB: INSERT notifications
+```
+
+### 3.3 Platba (Stripe) za konzultaci/premium
+
+```mermaid
+sequenceDiagram
+  participant U as Uživatel
+  participant UI as Next.js UI
+  participant PAY as /api/payment/create-session
+  participant STRIPE as Stripe
+  participant WH as /api/payment/webhook
+  participant DB as Supabase
+
+  U->>UI: Klik „Koupit Premium“
+  UI->>PAY: POST create-session
+  PAY->>STRIPE: create checkout session
+  STRIPE-->>UI: redirect_url
+  UI->>U: Redirect na Stripe Checkout
+
+  STRIPE->>WH: Webhook (paid)
+  WH->>DB: UPDATE users SET is_premium=true
+  WH-->>UI: (volitelně revalidate)
+```
+
+---
+
+# 4) Minimální SQL (výřez) pro start
+
+```sql
+-- species
+create table if not exists species (
+  id serial primary key,
+  common_name text,
+  latin_name text,
+  origin text,
+  wild_diet text,
+  captive_diet text,
+  temp_min numeric,
+  temp_max numeric,
+  humidity numeric,
+  uvb_need boolean default false,
+  enclosure_notes text
+);
+
+-- animals
+create table if not exists animals (
+  id serial primary key,
+  owner_id uuid references auth.users(id) on delete cascade,
+  species_id int references species(id),
+  name text not null,
+  sex text,
+  birth_date date,
+  acute_status boolean default false,
+  notes text,
+  created_at timestamptz default now()
+);
+
+-- husbandry_logs (typově volné přes payload)
+create table if not exists husbandry_logs (
+  id serial primary key,
+  animal_id int references animals(id) on delete cascade,
+  type text check (type in ('feeding','shed','weight','uvb','cleaning')),
+  payload jsonb not null,
+  at timestamptz default now(),
+  batch_id int
+);
+
+-- jednoduché RLS příklady
+alter table animals enable row level security;
+create policy "owner_can_select_animals"
+  on animals for select
+  using (owner_id = auth.uid());
+create policy "owner_can_modify_animals"
+  on animals for all
+  using (owner_id = auth.uid());
+```
+
+---
+
+# 5) Moduly & hranice odpovědnosti
+
+* **Pass (profil zvířete)** – vlastní jen UI + CRUD; žádná byznys logika mimo API.
+* **Husbandry** – logy jsou append-only; hromadné operace přes batch_id.
+* **Zdraví/Léky** – validace dávkování na API; AI (Alfonso) jen doporučuje.
+* **Reprodukce/Genetika** – kalkulace v `utils/genetics.ts`, čisté funkce + testy.
+* **Transfer** – stavový automat (`pending/accepted/rejected`) + QR token.
+* **Platby** – pouze přes server (webhook), nikdy na klientu.
+
+---
+
+
+
